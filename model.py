@@ -116,20 +116,22 @@ class UpBlock(nn.Module):
 
 
 class UNetDecoder(nn.Module):
-    def __init__(self, encoder_channels):
+    def __init__(self, encoder_channels, skip0_channels: int):
         super().__init__()
         self.up4 = UpBlock(encoder_channels[4], encoder_channels[3], encoder_channels[3])
         self.up3 = UpBlock(encoder_channels[3], encoder_channels[2], encoder_channels[2])
         self.up2 = UpBlock(encoder_channels[2], encoder_channels[1], encoder_channels[1])
         self.up1 = UpBlock(encoder_channels[1], encoder_channels[0], encoder_channels[0])
+        self.up0 = UpBlock(encoder_channels[0], skip0_channels, encoder_channels[0])
         self.final_conv = nn.Conv2d(encoder_channels[0], 1, kernel_size=1)
 
-    def forward(self, features):
+    def forward(self, features, skip0: torch.Tensor):
         c1, c2, c3, c4, c5 = features
         x = self.up4(c5, c4)
         x = self.up3(x, c3)
         x = self.up2(x, c2)
         x = self.up1(x, c1)
+        x = self.up0(x, skip0)
         return self.final_conv(x)
 
 
@@ -146,16 +148,29 @@ class PRPSegmenter(nn.Module):
         self.layer3 = backbone.layer3
         self.layer4 = backbone.layer4
 
+        self.stem_conv = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+        )
+        self.hm_stem = nn.Sequential(
+            nn.Conv2d(1, 64, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+        )
+        self.alpha = nn.Parameter(torch.tensor(1.0))
+
         self.prompt_encoder = PromptEncoder(in_channels=1, out_channels=512)
         self.attention = CrossAttentionFusion(channels=512)
         self.vit_refiner = ViTFeatureRefiner(channels=512, num_layers=2, num_heads=8)
 
-        self.decoder = UNetDecoder(
-            encoder_channels=[64, 64, 128, 256, 512]
-        )
+        self.decoder = UNetDecoder(encoder_channels=[64, 64, 128, 256, 512], skip0_channels=64)
 
     def forward(self, image: torch.Tensor, heatmap: torch.Tensor) -> torch.Tensor:
-        x1 = self.relu(self.bn1(self.conv1(image)))  # (B, 64, H/2, W/2)
+        x0_img = self.stem_conv(image)               # (B, 64, H, W)
+        x1_img = self.relu(self.bn1(self.conv1(image)))  # (B, 64, H/2, W/2)
+        x1_hm = self.hm_stem(heatmap)
+        x1 = x1_img + self.alpha * x1_hm
         x2 = self.layer1(self.maxpool(x1))           # (B, 64, H/4, W/4)
         x3 = self.layer2(x2)                         # (B, 128, H/8, W/8)
         x4 = self.layer3(x3)                         # (B, 256, H/16, W/16)
@@ -167,6 +182,5 @@ class PRPSegmenter(nn.Module):
         fused = self.attention(prompt_feat, x5)
         fused = self.vit_refiner(fused)
 
-        logits = self.decoder([x1, x2, x3, x4, fused])
-        logits = F.interpolate(logits, size=image.shape[2:], mode="bilinear", align_corners=False)
-        return torch.sigmoid(logits)
+        logits = self.decoder([x1, x2, x3, x4, fused], skip0=x0_img)
+        return logits

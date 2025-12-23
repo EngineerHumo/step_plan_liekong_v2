@@ -1,4 +1,5 @@
 import argparse
+import logging
 import os
 from typing import Optional, Tuple
 
@@ -12,6 +13,9 @@ from tqdm import tqdm
 from dataset import PRPDataset
 from model import PRPSegmenter
 from utils import dice_coefficient, iou_score
+
+IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
 
 def default_device() -> str:
@@ -28,7 +32,10 @@ def ensure_dir(path: str) -> None:
 def tensor_to_image(tensor: torch.Tensor) -> "np.ndarray":  # type: ignore[name-defined]
     import numpy as np
 
-    array = tensor.detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy()
+    tensor = tensor.detach().cpu()
+    if tensor.shape[0] == 3:
+        tensor = tensor * IMAGENET_STD + IMAGENET_MEAN
+    array = tensor.clamp(0, 1).permute(1, 2, 0).numpy()
     return (array * 255).astype(np.uint8)
 
 
@@ -102,11 +109,78 @@ def save_validation_batch(
         cv2.imwrite(os.path.join(epoch_dir, f"{basename}_gt1.png"), gt1_mask)
 
 
-def dice_bce_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    pred = pred.clamp(min=1e-6, max=1 - 1e-6)
-    dice = dice_coefficient(pred, target).mean()
-    bce = nn.functional.binary_cross_entropy(pred, target)
+def dice_bce_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    probs = torch.sigmoid(logits)
+    dice = dice_coefficient(probs, target).mean()
+    bce = nn.functional.binary_cross_entropy_with_logits(logits, target)
     return (1 - dice) + 0.5 * bce
+
+
+def click_patch_loss(logits: torch.Tensor, clicks: torch.Tensor, patch_size: int = 15) -> torch.Tensor:
+    probs = torch.sigmoid(logits)
+    radius = patch_size // 2
+    losses = []
+    for b in range(clicks.shape[0]):
+        y, x = clicks[b].tolist()
+        if y < 0 or x < 0:
+            continue
+        y0 = max(0, y - radius)
+        y1 = min(probs.shape[2], y + radius + 1)
+        x0 = max(0, x - radius)
+        x1 = min(probs.shape[3], x + radius + 1)
+        patch = probs[b : b + 1, :, y0:y1, x0:x1]
+        if patch.numel() == 0:
+            continue
+        patch_mean = patch.mean()
+        losses.append(nn.functional.binary_cross_entropy(patch_mean, torch.tensor(1.0, device=logits.device)))
+
+    if not losses:
+        return torch.tensor(0.0, device=logits.device)
+    return torch.stack(losses).mean()
+
+
+def _prepare_image_for_visdom(image: torch.Tensor) -> torch.Tensor:
+    image = image.detach().cpu()
+    if image.shape[0] == 3:
+        image = image * IMAGENET_STD + IMAGENET_MEAN
+    image = image.clamp(0, 1)
+    return image
+
+
+def _log_images_to_visdom(
+    viz: "visdom.Visdom",  # type: ignore[name-defined]
+    images: torch.Tensor,
+    heatmaps: torch.Tensor,
+    masks1: torch.Tensor,
+    preds1: torch.Tensor,
+    clicks: torch.Tensor,
+    epoch: int,
+    prefix: str = "val",
+):
+    def _prep_single(t: torch.Tensor) -> torch.Tensor:
+        tensor = t.detach().cpu().clamp(0, 1)
+        if tensor.dim() == 2:
+            tensor = tensor.unsqueeze(0)
+        if tensor.shape[0] == 1:
+            tensor = tensor.repeat(3, 1, 1)
+        return tensor
+
+    img = _prepare_image_for_visdom(images[0])
+    img_for_click = img.clone()
+    click_y, click_x = clicks[0].tolist()
+    if click_y >= 0 and click_x >= 0:
+        y = min(click_y, img_for_click.shape[1] - 1)
+        x = min(click_x, img_for_click.shape[2] - 1)
+        img_for_click[:, y : y + 1, x : x + 1] = torch.tensor([1.0, 0.0, 0.0]).view(3, 1, 1)
+    heatmap = _prep_single(heatmaps[0])
+    gt1 = _prep_single(masks1[0])
+    pred1 = _prep_single(preds1[0])
+
+    viz.image(img, win=f"{prefix}_input_image", opts={"title": f"{prefix.capitalize()} Input Epoch {epoch}"})
+    viz.image(img_for_click, win=f"{prefix}_click", opts={"title": f"{prefix.capitalize()} Click Epoch {epoch}"})
+    viz.image(heatmap, win=f"{prefix}_heatmap", opts={"title": f"{prefix.capitalize()} Heatmap Epoch {epoch}"})
+    viz.image(gt1, win=f"{prefix}_ground_truth_1", opts={"title": f"{prefix.capitalize()} GT1 Epoch {epoch}"})
+    viz.image(pred1, win=f"{prefix}_prediction_1", opts={"title": f"{prefix.capitalize()} Pred1 Epoch {epoch}"})
 
 
 def evaluate(
@@ -115,16 +189,18 @@ def evaluate(
     device: torch.device,
     save_root: Optional[str] = None,
     epoch: Optional[int] = None,
+    viz: Optional["visdom.Visdom"] = None,  # type: ignore[name-defined]
 ) -> tuple[float, float]:
     model.eval()
     dice_scores = []
     iou_scores = []
     with torch.no_grad():
-        for batch_idx, (images, heatmaps, masks1) in enumerate(loader):
+        for batch_idx, (images, heatmaps, masks1, clicks) in enumerate(loader):
             images = images.to(device)
             heatmaps = heatmaps.to(device)
             masks1 = masks1.to(device)
-            preds1 = model(images, heatmaps)
+            logits1 = model(images, heatmaps)
+            preds1 = torch.sigmoid(logits1)
             dice_scores.append(dice_coefficient(preds1, masks1).mean().item())
             iou_scores.append(iou_score(preds1, masks1).mean().item())
 
@@ -138,6 +214,8 @@ def evaluate(
                     epoch=epoch,
                     batch_idx=batch_idx,
                 )
+            if viz is not None and batch_idx == 0:
+                _log_images_to_visdom(viz, images, heatmaps, masks1, preds1, clicks, epoch, prefix="val")
     model.train()
     return float(sum(dice_scores) / len(dice_scores)), float(sum(iou_scores) / len(iou_scores))
 
@@ -156,6 +234,15 @@ def train(
     output_dir: str = "output",
 ):
     device = torch.device(device)
+    ensure_dir(output_dir)
+    log_file = os.path.join(output_dir, "train_log.txt")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.FileHandler(log_file, mode="w"), logging.StreamHandler()],
+    )
+    logging.info("Using device: %s", device)
+
     train_dataset = PRPDataset(train_dir, augment=True)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
 
@@ -178,66 +265,42 @@ def train(
 
         viz = visdom.Visdom(env=visdom_env, port=visdom_port)
         if not viz.check_connection():
-            print("[Visdom] Connection failed. Visualizations will be skipped.")
+            logging.warning("[Visdom] Connection failed. Visualizations will be skipped.")
             viz = None
 
-    ensure_dir(output_dir)
     best_val_dice = float("-inf")
     best_epoch: Optional[int] = None
+    best_epochs: list[tuple[int, float]] = []
 
     for epoch in range(1, epochs + 1):
         epoch_loss = 0.0
         progress = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}")
 
-        def log_to_visdom(
-            batch_images: torch.Tensor,
-            batch_heatmaps: torch.Tensor,
-            batch_masks1: torch.Tensor,
-            batch_preds1: torch.Tensor,
-        ) -> None:
-            """Visualize the current batch on Visdom."""
-
-            if viz is None:
-                return
-
-            def _prep_single(t: torch.Tensor) -> torch.Tensor:
-                tensor = t.detach().cpu().clamp(0, 1)
-                if tensor.dim() == 2:
-                    tensor = tensor.unsqueeze(0)
-                if tensor.shape[0] == 1:
-                    tensor = tensor.repeat(3, 1, 1)
-                return tensor
-
-            img = _prep_single(batch_images[0])
-            heatmap = _prep_single(batch_heatmaps[0])
-            gt1 = _prep_single(batch_masks1[0])
-            pred1 = _prep_single(batch_preds1[0])
-
-            viz.image(img, win="input_image", opts={"title": f"Input Epoch {epoch}"})
-            viz.image(heatmap, win="heatmap", opts={"title": f"Heatmap Epoch {epoch}"})
-            viz.image(gt1, win="ground_truth_1", opts={"title": f"GT1 Epoch {epoch}"})
-            viz.image(pred1, win="prediction_1", opts={"title": f"Pred1 Epoch {epoch}"})
-
-        for images, heatmaps, masks1 in progress:
+        for images, heatmaps, masks1, clicks in progress:
             images = images.to(device)
             heatmaps = heatmaps.to(device)
             masks1 = masks1.to(device)
+            clicks = clicks.to(device)
 
-            preds1 = model(images, heatmaps)
-            loss = dice_bce_loss(preds1, masks1)
+            logits1 = model(images, heatmaps)
+            main_loss = dice_bce_loss(logits1, masks1)
+            patch_loss = click_patch_loss(logits1, clicks)
+            loss = main_loss + 0.1 * patch_loss
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
             epoch_loss += loss.item()
-            progress.set_postfix(loss=loss.item())
+            progress.set_postfix(loss=loss.item(), patch_loss=patch_loss.item())
 
-            log_to_visdom(images, heatmaps, masks1, preds1)
+            if viz is not None:
+                preds1 = torch.sigmoid(logits1)
+                _log_images_to_visdom(viz, images, heatmaps, masks1, preds1, clicks, epoch, prefix="train")
 
         scheduler.step()
         avg_loss = epoch_loss / len(train_loader)
-        print(f"Epoch {epoch}: Train Loss={avg_loss:.4f}")
+        logging.info("Epoch %d: Train Loss=%.4f", epoch, avg_loss)
 
         # ==============================================================================
         # 核心修改：统一提取单卡模型用于验证和评估
@@ -250,28 +313,33 @@ def train(
             val_save_dir = os.path.join(output_dir, "val_outputs")
 
             # 使用 eval_model (单卡) 进行验证
-            val_dice, val_iou = evaluate(eval_model, val_loader, device, save_root=val_save_dir, epoch=epoch)
-            print(f"Epoch {epoch}: Val Dice={val_dice:.4f} | Val IoU={val_iou:.4f}")
+            val_dice, val_iou = evaluate(eval_model, val_loader, device, save_root=val_save_dir, epoch=epoch, viz=viz)
+            logging.info("Epoch %d: Val Dice=%.4f | Val IoU=%.4f", epoch, val_dice, val_iou)
+
+            best_epochs.append((epoch, val_dice))
+            best_epochs = sorted(best_epochs, key=lambda x: x[1], reverse=True)[:10]
 
             if val_dice > best_val_dice:
                 best_val_dice = val_dice
                 best_epoch = epoch
-                # 保存模型时直接用 eval_model (已经是解包过的状态)
                 torch.save(eval_model.state_dict(), os.path.join(output_dir, "best_model.pth"))
-                print(f"New best model saved with Val Dice {val_dice:.4f}")
+                logging.info("New best model saved with Val Dice %.4f", val_dice)
 
         # 使用 eval_model (单卡) 计算训练集指标，修复之前的崩溃点
         train_dice, train_iou = evaluate(eval_model, train_loader, device)
-        print(f"Epoch {epoch}: Train Dice={train_dice:.4f} | Train IoU={train_iou:.4f}")
+        logging.info("Epoch %d: Train Dice=%.4f | Train IoU=%.4f", epoch, train_dice, train_iou)
 
     # 最后保存也使用解包后的模型
     final_model_to_save = model.module if isinstance(model, nn.DataParallel) else model
     torch.save(final_model_to_save.state_dict(), os.path.join(output_dir, "final_model.pth"))
 
+    if best_epochs:
+        logging.info("Top 10 validation epochs (epoch, dice): %s", best_epochs)
+
     if best_epoch is not None:
-        print(f"Best validation model was achieved at epoch {best_epoch} with Dice {best_val_dice:.4f}")
+        logging.info("Best validation model was achieved at epoch %d with Dice %.4f", best_epoch, best_val_dice)
     else:
-        print("Validation was not run; no best epoch to report.")
+        logging.info("Validation was not run; no best epoch to report.")
 
 
 def parse_args():
