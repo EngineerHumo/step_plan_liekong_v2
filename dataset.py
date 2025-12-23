@@ -219,7 +219,7 @@ class PRPDataset(torch.utils.data.Dataset):
         mask1, heatmap, _ = self._simulate_click(mask1)
 
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        image = image.astype(np.float32) / 255.0
+        image = image.astype(np.float32)
 
         tensor_transform = A.Compose(
             [
