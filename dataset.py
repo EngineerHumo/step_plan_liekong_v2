@@ -49,15 +49,13 @@ class PRPDataset(torch.utils.data.Dataset):
 
             mask = self._load_mask(os.path.join(case_dir, "gt_1.png"))
             component_count = self._count_components(mask)
-            repeats = 3 if component_count > 1 else 1
-            for repeat_idx in range(repeats):
-                self.samples.append(
-                    {
-                        "case_dir": case_dir,
-                        "component_count": component_count,
-                        "repeat_idx": repeat_idx,
-                    }
-                )
+            self.samples.append(
+                {
+                    "case_dir": case_dir,
+                    "component_count": component_count,
+                    "repeat_idx": 0,
+                }
+            )
 
         self.spatial_transform = self._build_spatial_transform()
         self.color_transform = self._build_color_transform() if augment else None
@@ -154,7 +152,7 @@ class PRPDataset(torch.utils.data.Dataset):
         min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(dist)
         if max_val <= 0:
             return None
-        center = (float(max_loc[1]), float(max_loc[0]))  # cv2 returns (x, y)
+        center = (float(max_loc[0]), float(max_loc[1]))  # cv2 returns (x, y)
         return center, float(max_val)
 
     def _sample_point_within_circle(
@@ -178,16 +176,17 @@ class PRPDataset(torch.utils.data.Dataset):
         return int(y), int(x)
 
     def _simulate_click(self, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray, Optional[Tuple[int, int]]]:
-        h, w = mask.shape
-        if mask.max() == 0:
+        full_mask = mask.copy()
+        h, w = full_mask.shape
+        if full_mask.max() == 0:
             self._last_click = None
-            return mask, np.zeros((h, w), dtype=np.float32), None
+            return full_mask, np.zeros((h, w), dtype=np.float32), None
 
-        num_labels, labels = cv2.connectedComponents(mask, connectivity=8)
+        num_labels, labels = cv2.connectedComponents(full_mask, connectivity=8)
         valid_labels = [label for label in range(1, num_labels) if np.any(labels == label)]
         if not valid_labels:
             self._last_click = None
-            return mask, np.zeros((h, w), dtype=np.float32), None
+            return full_mask, np.zeros((h, w), dtype=np.float32), None
 
         selected_label = np.random.choice(valid_labels)
         component_mask = (labels == selected_label).astype(np.uint8)
@@ -195,13 +194,13 @@ class PRPDataset(torch.utils.data.Dataset):
         inscribed = self._largest_inscribed_circle(component_mask)
         if inscribed is None:
             self._last_click = None
-            return mask, np.zeros((h, w), dtype=np.float32), None
+            return full_mask, np.zeros((h, w), dtype=np.float32), None
 
         (center_x, center_y), radius = inscribed
         click_y, click_x = self._sample_point_within_circle((center_x, center_y), radius, (h, w))
         self._last_click = (click_y, click_x)
         heatmap = self._generate_heatmap(h, w, (click_y, click_x))
-        return mask, heatmap, self._last_click
+        return full_mask, heatmap, self._last_click
 
     def __getitem__(self, idx: int):
         sample = self.samples[idx]
