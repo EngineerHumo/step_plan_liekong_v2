@@ -1,66 +1,86 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torchvision import models
 
 
-class PromptEncoder(nn.Module):
-    def __init__(self, in_channels: int = 1, out_channels: int = 512):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Conv2d(in_channels, 32, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, out_channels, kernel_size=3, stride=2, padding=1),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.encoder(x)
+_heatmap_grid_cache: dict[tuple[int, int, torch.device, torch.dtype], tuple[torch.Tensor, torch.Tensor]] = {}
 
 
-class CrossAttentionFusion(nn.Module):
-    """Cross attention between prompt features (query) and image features (key/value)."""
+def _get_meshgrid(height: int, width: int, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    key = (height, width, device, dtype)
+    if key not in _heatmap_grid_cache:
+        y = torch.arange(height, device=device, dtype=dtype)
+        x = torch.arange(width, device=device, dtype=dtype)
+        yy, xx = torch.meshgrid(y, x, indexing="ij")
+        _heatmap_grid_cache[key] = (yy, xx)
+    return _heatmap_grid_cache[key]
 
-    def __init__(self, channels: int):
-        super().__init__()
-        self.q_proj = nn.Conv2d(channels, channels, kernel_size=1)
-        self.k_proj = nn.Conv2d(channels, channels, kernel_size=1)
-        self.v_proj = nn.Conv2d(channels, channels, kernel_size=1)
-        self.gamma = nn.Parameter(torch.tensor(0.1))
 
-    def forward(self, prompt_feat: torch.Tensor, image_feat: torch.Tensor) -> torch.Tensor:
-        """
-        Shapes:
-            prompt_feat: (B, C, H, W)
-            image_feat:  (B, C, H, W)
-        Attention flatten shapes:
-            Q: (B, H*W, C)
-            K/V: (B, H*W, C)
-            attn: (B, H*W, H*W)
-            attn_out: (B, H*W, C) -> reshaped back to (B, C, H, W)
-        """
-        b, c, h, w = prompt_feat.shape
-        q = self.q_proj(prompt_feat).flatten(2).transpose(1, 2)  # (B, H*W, C)
-        k = self.k_proj(image_feat).flatten(2).transpose(1, 2)  # (B, H*W, C)
-        v = self.v_proj(image_feat).flatten(2).transpose(1, 2)  # (B, H*W, C)
+def build_gaussian_heatmap(
+    clicks: torch.Tensor,
+    in_hw: tuple[int, int],
+    out_hw: tuple[int, int],
+    sigma: float,
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+    normalize_peak: bool = True,
+) -> torch.Tensor:
+    """Generate a per-sample Gaussian heatmap from click coordinates.
 
-        attn_scores = torch.matmul(q, k.transpose(1, 2)) / (c ** 0.5)  # (B, H*W, H*W)
-        attn_probs = torch.softmax(attn_scores, dim=-1)
-        attn_out = torch.matmul(attn_probs, v)  # (B, H*W, C)
-        attn_out = attn_out.transpose(1, 2).reshape(b, c, h, w)
-        return image_feat + self.gamma * attn_out
+    Coordinates are mapped with align_corners=False convention using pixel centers.
+    Sigma is defined in the pixel units of the *output* feature map (deep feature space).
+    """
+
+    batch = clicks.shape[0]
+    h_out, w_out = out_hw
+    heatmap = torch.zeros((batch, 1, h_out, w_out), device=device, dtype=dtype)
+    yy, xx = _get_meshgrid(h_out, w_out, device, dtype)
+
+    scale_y = h_out / float(in_hw[0])
+    scale_x = w_out / float(in_hw[1])
+
+    for b in range(batch):
+        y_in, x_in = clicks[b].tolist()
+        if y_in < 0 or x_in < 0:
+            continue
+
+        y_out = (float(y_in) + 0.5) * scale_y - 0.5
+        x_out = (float(x_in) + 0.5) * scale_x - 0.5
+
+        dist = (yy - y_out) ** 2 + (xx - x_out) ** 2
+        hm = torch.exp(-dist / (2 * sigma ** 2))
+        if normalize_peak:
+            peak = hm.max()
+            if peak > 0:
+                hm = hm / peak
+        heatmap[b, 0] = hm
+
+    return heatmap
+
+
+def build_heatmap4_5(
+    clicks: torch.Tensor,
+    in_hw: tuple[int, int],
+    x4_hw: tuple[int, int],
+    x5_hw: tuple[int, int],
+    sigma4: float = 2.0,
+    sigma5: float = 1.5,
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Wrapper to build deep-scale heatmaps for x4 and x5 injection."""
+
+    hm4 = build_gaussian_heatmap(clicks, in_hw, x4_hw, sigma4, dtype=dtype, device=device)
+    hm5 = build_gaussian_heatmap(clicks, in_hw, x5_hw, sigma5, dtype=dtype, device=device)
+    return hm4, hm5
 
 
 class ViTFeatureRefiner(nn.Module):
     """Lightweight ViT-style encoder to model long-range dependencies."""
 
-    def __init__(self, channels: int, num_layers: int = 2, num_heads: int = 8, mlp_ratio: float = 4.0):
+    def __init__(self, channels: int, num_layers: int = 1, num_heads: int = 4, mlp_ratio: float = 4.0):
         super().__init__()
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=channels,
@@ -136,7 +156,7 @@ class UNetDecoder(nn.Module):
 
 
 class PRPSegmenter(nn.Module):
-    def __init__(self, pretrained: bool = True):
+    def __init__(self, pretrained: bool = True, prompt_dropout_p: float = 0.2):
         super().__init__()
         backbone = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None)
         self.conv1 = backbone.conv1
@@ -153,34 +173,91 @@ class PRPSegmenter(nn.Module):
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
         )
-        self.hm_stem = nn.Sequential(
-            nn.Conv2d(1, 64, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(64),
+
+        # Heatmap stems for deep prompt injection
+        self.hm4_stem = nn.Sequential(
+            nn.Conv2d(1, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
         )
-        self.alpha = nn.Parameter(torch.tensor(1.0))
+        self.hm5_stem = nn.Sequential(
+            nn.Conv2d(1, 512, kernel_size=3, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+        )
 
-        self.prompt_encoder = PromptEncoder(in_channels=1, out_channels=512)
-        self.attention = CrossAttentionFusion(channels=512)
-        self.vit_refiner = ViTFeatureRefiner(channels=512, num_layers=2, num_heads=8)
+        # Concat + 1x1 mix for x4/x5
+        self.mix4 = nn.Sequential(
+            nn.Conv2d(256 + 256, 256, kernel_size=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+        )
+        self.mix5 = nn.Sequential(
+            nn.Conv2d(512 + 512, 512, kernel_size=1, bias=False),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+        )
+
+        # Gating parameters initialized to negative values for conservative blending
+        self.g4_raw = nn.Parameter(torch.tensor(-2.0))
+        self.g5_raw = nn.Parameter(torch.tensor(-2.0))
+
+        # Prompt-conditioned ViT bottleneck on x5
+        self.proj_in = nn.Sequential(
+            nn.Conv2d(512, 256, kernel_size=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+        )
+        self.vit_refiner_256 = ViTFeatureRefiner(channels=256, num_layers=1, num_heads=4, mlp_ratio=4.0)
+        self.proj_out = nn.Sequential(
+            nn.Conv2d(256, 512, kernel_size=1, bias=False),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+        )
 
         self.decoder = UNetDecoder(encoder_channels=[64, 64, 128, 256, 512], skip0_channels=64)
+        self.prompt_dropout_p = prompt_dropout_p
 
-    def forward(self, image: torch.Tensor, heatmap: torch.Tensor) -> torch.Tensor:
-        x0_img = self.stem_conv(image)               # (B, 64, H, W)
+    def _apply_prompt_dropout(self, hm: torch.Tensor) -> torch.Tensor:
+        if self.training and self.prompt_dropout_p > 0:
+            keep_mask = (torch.rand_like(hm) > self.prompt_dropout_p).float()
+            return hm * keep_mask
+        return hm
+
+    def forward(self, image: torch.Tensor, clicks: torch.Tensor) -> torch.Tensor:
+        x0_img = self.stem_conv(image)  # (B, 64, H, W)
         x1_img = self.relu(self.bn1(self.conv1(image)))  # (B, 64, H/2, W/2)
-        x1_hm = self.hm_stem(heatmap)
-        x1 = x1_img + self.alpha * x1_hm
-        x2 = self.layer1(self.maxpool(x1))           # (B, 64, H/4, W/4)
-        x3 = self.layer2(x2)                         # (B, 128, H/8, W/8)
-        x4 = self.layer3(x3)                         # (B, 256, H/16, W/16)
-        x5 = self.layer4(x4)                         # (B, 512, H/32, W/32)
+        x2 = self.layer1(self.maxpool(x1_img))  # (B, 64, H/4, W/4)
+        x3 = self.layer2(x2)  # (B, 128, H/8, W/8)
+        x4_img = self.layer3(x3)  # (B, 256, H/16, W/16)
+        x5_img = self.layer4(x4_img)  # (B, 512, H/32, W/32)
 
-        prompt_feat = self.prompt_encoder(heatmap)
-        prompt_feat = F.interpolate(prompt_feat, size=x5.shape[2:], mode="bilinear", align_corners=False)
+        hm4, hm5 = build_heatmap4_5(
+            clicks=clicks,
+            in_hw=(image.shape[2], image.shape[3]),
+            x4_hw=(x4_img.shape[2], x4_img.shape[3]),
+            x5_hw=(x5_img.shape[2], x5_img.shape[3]),
+            dtype=x4_img.dtype,
+            device=x4_img.device,
+        )
 
-        fused = self.attention(prompt_feat, x5)
-        fused = self.vit_refiner(fused)
+        hm4 = self._apply_prompt_dropout(hm4)
+        hm5 = self._apply_prompt_dropout(hm5)
 
-        logits = self.decoder([x1, x2, x3, x4, fused], skip0=x0_img)
+        hm4_feat = self.hm4_stem(hm4)
+        hm5_feat = self.hm5_stem(hm5)
+
+        x4_cond = self.mix4(torch.cat([x4_img, hm4_feat], dim=1))
+        g4 = torch.sigmoid(self.g4_raw)
+        x4_out = x4_img + g4 * (x4_cond - x4_img)
+
+        x5_cond = self.mix5(torch.cat([x5_img, hm5_feat], dim=1))
+        g5 = torch.sigmoid(self.g5_raw)
+        x5_blend = x5_img + g5 * (x5_cond - x5_img)
+
+        x5_256 = self.proj_in(x5_blend)
+        x5_256 = self.vit_refiner_256(x5_256)
+        x5_out = self.proj_out(x5_256)
+
+        logits = self.decoder([x1_img, x2, x3, x4_out, x5_out], skip0=x0_img)
         return logits
