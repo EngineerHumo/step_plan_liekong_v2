@@ -116,23 +116,17 @@ def dice_bce_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return (1 - dice) + 0.5 * bce
 
 
-def click_patch_loss(logits: torch.Tensor, clicks: torch.Tensor, patch_size: int = 15) -> torch.Tensor:
-    probs = torch.sigmoid(logits)
-    radius = patch_size // 2
+def click_point_loss(logits: torch.Tensor, clicks: torch.Tensor) -> torch.Tensor:
     losses = []
+    _, _, h, w = logits.shape
     for b in range(clicks.shape[0]):
         y, x = clicks[b].tolist()
         if y < 0 or x < 0:
             continue
-        y0 = max(0, y - radius)
-        y1 = min(probs.shape[2], y + radius + 1)
-        x0 = max(0, x - radius)
-        x1 = min(probs.shape[3], x + radius + 1)
-        patch = probs[b : b + 1, :, y0:y1, x0:x1]
-        if patch.numel() == 0:
-            continue
-        patch_mean = patch.mean()
-        losses.append(nn.functional.binary_cross_entropy(patch_mean, torch.tensor(1.0, device=logits.device)))
+        y = int(min(max(y, 0), h - 1))
+        x = int(min(max(x, 0), w - 1))
+        logit = logits[b, 0, y, x]
+        losses.append(nn.functional.binary_cross_entropy_with_logits(logit, torch.tensor(1.0, device=logits.device)))
 
     if not losses:
         return torch.tensor(0.0, device=logits.device)
@@ -197,9 +191,9 @@ def evaluate(
     with torch.no_grad():
         for batch_idx, (images, heatmaps, masks1, clicks) in enumerate(loader):
             images = images.to(device)
-            heatmaps = heatmaps.to(device)
             masks1 = masks1.to(device)
-            logits1 = model(images, heatmaps)
+            clicks = clicks.to(device)
+            logits1 = model(images, clicks)
             preds1 = torch.sigmoid(logits1)
             dice_scores.append(dice_coefficient(preds1, masks1).mean().item())
             iou_scores.append(iou_score(preds1, masks1).mean().item())
@@ -271,6 +265,7 @@ def train(
     best_val_dice = float("-inf")
     best_epoch: Optional[int] = None
     best_epochs: list[tuple[int, float]] = []
+    saved_model_paths: dict[int, str] = {}
 
     for epoch in range(1, epochs + 1):
         epoch_loss = 0.0
@@ -278,21 +273,20 @@ def train(
 
         for images, heatmaps, masks1, clicks in progress:
             images = images.to(device)
-            heatmaps = heatmaps.to(device)
             masks1 = masks1.to(device)
             clicks = clicks.to(device)
 
-            logits1 = model(images, heatmaps)
+            logits1 = model(images, clicks)
             main_loss = dice_bce_loss(logits1, masks1)
-            patch_loss = click_patch_loss(logits1, clicks)
-            loss = main_loss + 0.1 * patch_loss
+            point_loss = click_point_loss(logits1, clicks)
+            loss = main_loss + 0.01 * point_loss
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
             epoch_loss += loss.item()
-            progress.set_postfix(loss=loss.item(), patch_loss=patch_loss.item())
+            progress.set_postfix(loss=loss.item(), point_loss=point_loss.item())
 
             if viz is not None:
                 preds1 = torch.sigmoid(logits1)
@@ -317,24 +311,31 @@ def train(
             logging.info("Epoch %d: Val Dice=%.4f | Val IoU=%.4f", epoch, val_dice, val_iou)
 
             best_epochs.append((epoch, val_dice))
-            best_epochs = sorted(best_epochs, key=lambda x: x[1], reverse=True)[:10]
+            best_epochs = sorted(best_epochs, key=lambda x: x[1], reverse=True)[:3]
+
+            current_top_epochs = {e for e, _ in best_epochs}
+            for saved_epoch, path in list(saved_model_paths.items()):
+                if saved_epoch not in current_top_epochs and os.path.exists(path):
+                    os.remove(path)
+                    del saved_model_paths[saved_epoch]
+
+            for e, d in best_epochs:
+                if e not in saved_model_paths:
+                    model_path = os.path.join(output_dir, f"best_epoch_{e:03d}_dice_{d:.4f}.pth")
+                    torch.save(eval_model.state_dict(), model_path)
+                    saved_model_paths[e] = model_path
 
             if val_dice > best_val_dice:
                 best_val_dice = val_dice
                 best_epoch = epoch
-                torch.save(eval_model.state_dict(), os.path.join(output_dir, "best_model.pth"))
-                logging.info("New best model saved with Val Dice %.4f", val_dice)
+                logging.info("New best model tracked with Val Dice %.4f", val_dice)
 
         # 使用 eval_model (单卡) 计算训练集指标，修复之前的崩溃点
         train_dice, train_iou = evaluate(eval_model, train_loader, device)
         logging.info("Epoch %d: Train Dice=%.4f | Train IoU=%.4f", epoch, train_dice, train_iou)
 
-    # 最后保存也使用解包后的模型
-    final_model_to_save = model.module if isinstance(model, nn.DataParallel) else model
-    torch.save(final_model_to_save.state_dict(), os.path.join(output_dir, "final_model.pth"))
-
     if best_epochs:
-        logging.info("Top 10 validation epochs (epoch, dice): %s", best_epochs)
+        logging.info("Top 3 validation epochs (epoch, dice): %s", best_epochs)
 
     if best_epoch is not None:
         logging.info("Best validation model was achieved at epoch %d with Dice %.4f", best_epoch, best_val_dice)
