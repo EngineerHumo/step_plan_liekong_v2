@@ -177,8 +177,8 @@ class PRPSegmenter(nn.Module):
         self.layer4 = backbone.layer4
 
         self.stem_conv = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(64),
+            nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
         )
 
@@ -223,7 +223,7 @@ class PRPSegmenter(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        self.decoder = UNetDecoder(encoder_channels=[64, 64, 128, 256, 512], skip0_channels=64)
+        self.decoder = UNetDecoder(encoder_channels=[64, 64, 128, 256, 512], skip0_channels=32)
         self.prompt_dropout_p = prompt_dropout_p
 
     def _apply_prompt_dropout_pair(
@@ -239,7 +239,6 @@ class PRPSegmenter(nn.Module):
         return hm4, hm5
 
     def forward(self, image: torch.Tensor, clicks: torch.Tensor) -> torch.Tensor:
-        x0_img = self.stem_conv(image)  # (B, 64, H, W)
         x1_img = self.relu(self.bn1(self.conv1(image)))  # (B, 64, H/2, W/2)
         x2 = self.layer1(self.maxpool(x1_img))  # (B, 64, H/4, W/4)
         x3 = self.layer2(x2)  # (B, 128, H/8, W/8)
@@ -272,5 +271,6 @@ class PRPSegmenter(nn.Module):
         x5_256 = self.vit_refiner_256(x5_256)
         x5_out = self.proj_out(x5_256)
 
+        x0_img = self.stem_conv(image)  # (B, 32, H, W)
         logits = self.decoder([x1_img, x2, x3, x4_out, x5_out], skip0=x0_img)
         return logits

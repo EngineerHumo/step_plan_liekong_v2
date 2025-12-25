@@ -267,7 +267,7 @@ def train(
             main_loss = dice_bce_loss(logits1, masks1)
             loss = main_loss
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
 
