@@ -1,3 +1,7 @@
+'''
+train:python /data/jiaqi/step_plan_liekong_v2/train.py --use_visdom
+'''
+
 import argparse
 import logging
 import os
