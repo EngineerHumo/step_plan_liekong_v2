@@ -21,7 +21,7 @@ IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 def default_device() -> str:
     """Prefer CUDA when available, defaulting to GPU 0 for multi-GPU training."""
     if torch.cuda.is_available():
-        return "cuda:1"              ###同步修改
+        return "cuda:0"              ###同步修改
     return "cpu"
 
 
@@ -248,7 +248,7 @@ def train(
     model = PRPSegmenter()
     if torch.cuda.device_count() > 1 and device.type == "cuda":
         print("Using DataParallel on GPUs: 0 and 1")
-        model = nn.DataParallel(model, device_ids=[1])
+        model = nn.DataParallel(model, device_ids=[0,1])
     model = model.to(device)
     optimizer = AdamW(model.parameters(), lr=lr)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
@@ -348,8 +348,8 @@ def parse_args():
     parser.add_argument("--train_dir", type=str, default="dataset_liekong/train", help="Path to training dataset")
     parser.add_argument("--val_dir", type=str, default="dataset_liekong/val", help="Path to validation dataset")
     parser.add_argument("--epochs", type=int, default=400)
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=6e-4)
+    parser.add_argument("--batch_size", type=int, default=6)
+    parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--device", type=str, default=default_device())
     parser.add_argument("--use_visdom", action="store_true", help="Enable Visdom visualization")
@@ -357,6 +357,9 @@ def parse_args():
     parser.add_argument("--visdom_port", type=int, default=8097, help="Visdom server port")
     parser.add_argument("--output_dir", type=str, default="output", help="Directory to save validation outputs and models")
     return parser.parse_args()
+
+
+
 
 
 if __name__ == "__main__":
