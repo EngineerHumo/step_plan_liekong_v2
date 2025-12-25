@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchvision import models
 
 
@@ -87,6 +88,8 @@ class ViTFeatureRefiner(nn.Module):
             nhead=num_heads,
             dim_feedforward=int(channels * mlp_ratio),
             batch_first=True,
+            norm_first=True,
+            activation="gelu",
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
@@ -119,7 +122,11 @@ class ViTFeatureRefiner(nn.Module):
 class UpBlock(nn.Module):
     def __init__(self, in_channels: int, skip_channels: int, out_channels: int):
         super().__init__()
-        self.up = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
+        self.up_conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
         self.conv = nn.Sequential(
             nn.Conv2d(out_channels + skip_channels, out_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(out_channels),
@@ -130,7 +137,8 @@ class UpBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
-        x = self.up(x)
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = self.up_conv(x)
         x = torch.cat([x, skip], dim=1)
         return self.conv(x)
 
@@ -199,8 +207,8 @@ class PRPSegmenter(nn.Module):
         )
 
         # Gating parameters initialized to negative values for conservative blending
-        self.g4_raw = nn.Parameter(torch.tensor(-2.0))
-        self.g5_raw = nn.Parameter(torch.tensor(-2.0))
+        self.g4_raw = nn.Parameter(torch.full((1, 256, 1, 1), -2.0))
+        self.g5_raw = nn.Parameter(torch.full((1, 512, 1, 1), -2.0))
 
         # Prompt-conditioned ViT bottleneck on x5
         self.proj_in = nn.Sequential(
@@ -218,11 +226,17 @@ class PRPSegmenter(nn.Module):
         self.decoder = UNetDecoder(encoder_channels=[64, 64, 128, 256, 512], skip0_channels=64)
         self.prompt_dropout_p = prompt_dropout_p
 
-    def _apply_prompt_dropout(self, hm: torch.Tensor) -> torch.Tensor:
+    def _apply_prompt_dropout_pair(
+        self, hm4: torch.Tensor, hm5: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.training and self.prompt_dropout_p > 0:
-            keep_mask = (torch.rand_like(hm) > self.prompt_dropout_p).float()
-            return hm * keep_mask
-        return hm
+            batch_size = hm4.shape[0]
+            keep_mask = (
+                torch.rand((batch_size, 1, 1, 1), device=hm4.device, dtype=hm4.dtype)
+                > self.prompt_dropout_p
+            ).float()
+            return hm4 * keep_mask, hm5 * keep_mask
+        return hm4, hm5
 
     def forward(self, image: torch.Tensor, clicks: torch.Tensor) -> torch.Tensor:
         x0_img = self.stem_conv(image)  # (B, 64, H, W)
@@ -241,8 +255,7 @@ class PRPSegmenter(nn.Module):
             device=x4_img.device,
         )
 
-        hm4 = self._apply_prompt_dropout(hm4)
-        hm5 = self._apply_prompt_dropout(hm5)
+        hm4, hm5 = self._apply_prompt_dropout_pair(hm4, hm5)
 
         hm4_feat = self.hm4_stem(hm4)
         hm5_feat = self.hm5_stem(hm5)

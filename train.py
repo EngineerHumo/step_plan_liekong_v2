@@ -120,23 +120,6 @@ def dice_bce_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return (1 - dice) + 0.5 * bce
 
 
-def click_point_loss(logits: torch.Tensor, clicks: torch.Tensor) -> torch.Tensor:
-    losses = []
-    _, _, h, w = logits.shape
-    for b in range(clicks.shape[0]):
-        y, x = clicks[b].tolist()
-        if y < 0 or x < 0:
-            continue
-        y = int(min(max(y, 0), h - 1))
-        x = int(min(max(x, 0), w - 1))
-        logit = logits[b, 0, y, x]
-        losses.append(nn.functional.binary_cross_entropy_with_logits(logit, torch.tensor(1.0, device=logits.device)))
-
-    if not losses:
-        return torch.tensor(0.0, device=logits.device)
-    return torch.stack(losses).mean()
-
-
 def _prepare_image_for_visdom(image: torch.Tensor) -> torch.Tensor:
     image = image.detach().cpu()
     if image.shape[0] == 3:
@@ -282,15 +265,14 @@ def train(
 
             logits1 = model(images, clicks)
             main_loss = dice_bce_loss(logits1, masks1)
-            point_loss = click_point_loss(logits1, clicks)
-            loss = main_loss + 0.01 * point_loss
+            loss = main_loss
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
             epoch_loss += loss.item()
-            progress.set_postfix(loss=loss.item(), point_loss=point_loss.item())
+            progress.set_postfix(loss=loss.item())
 
             if viz is not None:
                 preds1 = torch.sigmoid(logits1)
@@ -313,6 +295,31 @@ def train(
             # 使用 eval_model (单卡) 进行验证
             val_dice, val_iou = evaluate(eval_model, val_loader, device, save_root=val_save_dir, epoch=epoch, viz=viz)
             logging.info("Epoch %d: Val Dice=%.4f | Val IoU=%.4f", epoch, val_dice, val_iou)
+
+            if viz is not None:
+                try:
+                    val_images, val_heatmaps, val_masks1, val_clicks = next(iter(val_loader))
+                except StopIteration:
+                    val_images = val_heatmaps = val_masks1 = val_clicks = None
+                else:
+                    val_images = val_images.to(device)
+                    val_masks1 = val_masks1.to(device)
+                    val_clicks = val_clicks.to(device)
+                    eval_model.eval()
+                    with torch.no_grad():
+                        logits_val = eval_model(val_images, val_clicks)
+                        preds_val = torch.sigmoid(logits_val)
+                    eval_model.train()
+                    _log_images_to_visdom(
+                        viz,
+                        val_images,
+                        val_heatmaps,
+                        val_masks1,
+                        preds_val,
+                        val_clicks,
+                        epoch,
+                        prefix="val",
+                    )
 
             best_epochs.append((epoch, val_dice))
             best_epochs = sorted(best_epochs, key=lambda x: x[1], reverse=True)[:3]

@@ -144,37 +144,6 @@ class PRPDataset(torch.utils.data.Dataset):
         num_labels, _ = cv2.connectedComponents(mask, connectivity=8)
         return max(num_labels - 1, 0)
 
-    def _largest_inscribed_circle(self, mask: np.ndarray) -> Optional[Tuple[Tuple[float, float], float]]:
-        if mask.max() == 0:
-            return None
-
-        dist = cv2.distanceTransform(mask, distanceType=cv2.DIST_L2, maskSize=5)
-        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(dist)
-        if max_val <= 0:
-            return None
-        center = (float(max_loc[0]), float(max_loc[1]))  # cv2 returns (x, y)
-        return center, float(max_val)
-
-    def _sample_point_within_circle(
-        self, center: Tuple[float, float], radius: float, shape: Tuple[int, int]
-    ) -> Tuple[int, int]:
-        h, w = shape
-        grid_y, grid_x = np.meshgrid(np.arange(h), np.arange(w), indexing="ij")
-        distances = np.sqrt((grid_y - center[1]) ** 2 + (grid_x - center[0]) ** 2)
-        circle_mask = distances <= radius
-        if not circle_mask.any():
-            return int(round(center[1])), int(round(center[0]))
-
-        weights = np.where(circle_mask, 1.0 / (distances + 1e-3), 0.0)
-        weights_sum = weights.sum()
-        if weights_sum <= 0:
-            return int(round(center[1])), int(round(center[0]))
-
-        weights_flat = weights.reshape(-1) / weights_sum
-        idx = np.random.choice(len(weights_flat), p=weights_flat)
-        y, x = divmod(idx, w)
-        return int(y), int(x)
-
     def _simulate_click(self, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray, Optional[Tuple[int, int]]]:
         full_mask = mask.copy()
         h, w = full_mask.shape
@@ -191,13 +160,28 @@ class PRPDataset(torch.utils.data.Dataset):
         selected_label = np.random.choice(valid_labels)
         component_mask = (labels == selected_label).astype(np.uint8)
 
-        inscribed = self._largest_inscribed_circle(component_mask)
-        if inscribed is None:
+        dist_map = cv2.distanceTransform(component_mask, distanceType=cv2.DIST_L2, maskSize=5)
+        _, max_val, _, max_loc = cv2.minMaxLoc(dist_map)
+        if max_val <= 0:
             self._last_click = None
             return full_mask, np.zeros((h, w), dtype=np.float32), None
 
-        (center_x, center_y), radius = inscribed
-        click_y, click_x = self._sample_point_within_circle((center_x, center_y), radius, (h, w))
+        cy, cx = float(max_loc[1]), float(max_loc[0])
+        ys, xs = np.nonzero(component_mask)
+        if len(ys) == 0:
+            self._last_click = None
+            return full_mask, np.zeros((h, w), dtype=np.float32), None
+
+        distances = np.sqrt((ys - cy) ** 2 + (xs - cx) ** 2)
+        weights = 1.0 / (distances + 1e-3)
+        weights_sum = weights.sum()
+        if weights_sum <= 0:
+            self._last_click = None
+            return full_mask, np.zeros((h, w), dtype=np.float32), None
+
+        probabilities = weights / weights_sum
+        idx = np.random.choice(len(probabilities), p=probabilities)
+        click_y, click_x = int(ys[idx]), int(xs[idx])
         self._last_click = (click_y, click_x)
         heatmap = self._generate_heatmap(h, w, (click_y, click_x))
         return full_mask, heatmap, self._last_click
