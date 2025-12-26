@@ -1,5 +1,8 @@
+from contextlib import contextmanager
+
 import torch
 import torch.nn as nn
+from torch.nn.modules.batchnorm import _BatchNorm
 from torch.utils.checkpoint import checkpoint
 from torchvision import models
 
@@ -221,10 +224,40 @@ class PRPSegmenter(nn.Module):
         self.prompt_dropout_p = prompt_dropout_p
         self.use_ckpt = use_ckpt
 
-    def _maybe_ckpt(self, fn, *args):
+    @staticmethod
+    @contextmanager
+    def _maybe_freeze_bn_tracking(module: nn.Module, disable: bool):
+        """Temporarily disable BatchNorm running-stat updates when requested."""
+
+        if not disable:
+            yield
+            return
+
+        bn_layers = [m for m in module.modules() if isinstance(m, _BatchNorm)]
+        if not bn_layers:
+            yield
+            return
+
+        original_states = [bn.track_running_stats for bn in bn_layers]
+        try:
+            for bn in bn_layers:
+                bn.track_running_stats = False
+            yield
+        finally:
+            for bn, state in zip(bn_layers, original_states):
+                bn.track_running_stats = state
+
+    def _maybe_ckpt_module(self, module: nn.Module, *args):
+        """Checkpoint a module without double-updating BatchNorm statistics."""
+
+        def run_with_bn_guard(*inputs):
+            disable_running_stats = not torch.is_grad_enabled()
+            with self._maybe_freeze_bn_tracking(module, disable_running_stats):
+                return module(*inputs)
+
         if self.training and self.use_ckpt:
-            return checkpoint(fn, *args, use_reentrant=False)
-        return fn(*args)
+            return checkpoint(run_with_bn_guard, *args, use_reentrant=False)
+        return module(*args)
 
     def _apply_prompt_dropout_pair(self, hm4: torch.Tensor, hm5: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if self.training and self.prompt_dropout_p > 0:
@@ -238,10 +271,10 @@ class PRPSegmenter(nn.Module):
 
     def forward(self, image: torch.Tensor, clicks: torch.Tensor) -> torch.Tensor:
         x1_img = self.relu(self.bn1(self.conv1(image)))  # (B, 64, H/2, W/2)
-        x2 = self._maybe_ckpt(lambda t: self.layer1(t), self.maxpool(x1_img))  # (B, 64, H/4, W/4)
-        x3 = self._maybe_ckpt(lambda t: self.layer2(t), x2)  # (B, 128, H/8, W/8)
-        x4_img = self._maybe_ckpt(lambda t: self.layer3(t), x3)  # (B, 256, H/16, W/16)
-        x5_img = self._maybe_ckpt(lambda t: self.layer4(t), x4_img)  # (B, 512, H/32, W/32)
+        x2 = self._maybe_ckpt_module(self.layer1, self.maxpool(x1_img))  # (B, 64, H/4, W/4)
+        x3 = self._maybe_ckpt_module(self.layer2, x2)  # (B, 128, H/8, W/8)
+        x4_img = self._maybe_ckpt_module(self.layer3, x3)  # (B, 256, H/16, W/16)
+        x5_img = self._maybe_ckpt_module(self.layer4, x4_img)  # (B, 512, H/32, W/32)
 
         hm4, hm5 = build_heatmap4_5(
             clicks=clicks,
@@ -265,9 +298,9 @@ class PRPSegmenter(nn.Module):
         g5 = torch.sigmoid(self.g5_raw)
         x5_blend = x5_img + g5 * (x5_cond - x5_img)
 
-        x5_256 = self._maybe_ckpt(lambda t: self.proj_in(t), x5_blend)
-        x5_256 = self._maybe_ckpt(lambda t: self.vit_refiner_256(t), x5_256)
-        x5_out = self._maybe_ckpt(lambda t: self.proj_out(t), x5_256)
+        x5_256 = self._maybe_ckpt_module(self.proj_in, x5_blend)
+        x5_256 = self._maybe_ckpt_module(self.vit_refiner_256, x5_256)
+        x5_out = self._maybe_ckpt_module(self.proj_out, x5_256)
 
         x0_img = self.stem_conv(image)  # (B, 64, H, W)
         logits = self.decoder([x1_img, x2, x3, x4_out, x5_out], skip0=x0_img)
