@@ -1,4 +1,4 @@
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 import torch
 import torch.nn as nn
@@ -228,7 +228,6 @@ class PRPSegmenter(nn.Module):
     @contextmanager
     def _maybe_freeze_bn_tracking(module: nn.Module, disable: bool):
         """Temporarily disable BatchNorm running-stat updates when requested."""
-
         if not disable:
             yield
             return
@@ -248,15 +247,23 @@ class PRPSegmenter(nn.Module):
                 bn.track_running_stats = state
 
     def _maybe_ckpt_module(self, module: nn.Module, *args):
-        """Checkpoint a module without double-updating BatchNorm statistics."""
-
-        def run_with_bn_guard(*inputs):
-            disable_running_stats = not torch.is_grad_enabled()
-            with self._maybe_freeze_bn_tracking(module, disable_running_stats):
-                return module(*inputs)
-
+        """
+        Checkpoint a module, and if it contains BatchNorm, prevent double-updating
+        BN running stats by freezing tracking only during recompute.
+        """
         if self.training and self.use_ckpt:
-            return checkpoint(run_with_bn_guard, *args, use_reentrant=False)
+            has_bn = any(isinstance(m, _BatchNorm) for m in module.modules())
+
+            if has_bn:
+                def context_fn():
+                    # forward: normal
+                    # recompute: freeze BN running-stat tracking
+                    return nullcontext(), self._maybe_freeze_bn_tracking(module, True)
+
+                return checkpoint(module, *args, use_reentrant=False, context_fn=context_fn)
+
+            return checkpoint(module, *args, use_reentrant=False)
+
         return module(*args)
 
     def _apply_prompt_dropout_pair(self, hm4: torch.Tensor, hm5: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
