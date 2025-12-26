@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 from torchvision import models
 
 
@@ -87,6 +88,7 @@ class ViTFeatureRefiner(nn.Module):
             nhead=num_heads,
             dim_feedforward=int(channels * mlp_ratio),
             batch_first=True,
+            activation="gelu",
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
@@ -156,7 +158,7 @@ class UNetDecoder(nn.Module):
 
 
 class PRPSegmenter(nn.Module):
-    def __init__(self, pretrained: bool = True, prompt_dropout_p: float = 0.2):
+    def __init__(self, pretrained: bool = True, prompt_dropout_p: float = 0.2, use_ckpt: bool = True):
         super().__init__()
         backbone = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None)
         self.conv1 = backbone.conv1
@@ -199,8 +201,8 @@ class PRPSegmenter(nn.Module):
         )
 
         # Gating parameters initialized to negative values for conservative blending
-        self.g4_raw = nn.Parameter(torch.tensor(-2.0))
-        self.g5_raw = nn.Parameter(torch.tensor(-2.0))
+        self.g4_raw = nn.Parameter(torch.full((1, 256, 1, 1), -2.0))
+        self.g5_raw = nn.Parameter(torch.full((1, 512, 1, 1), -2.0))
 
         # Prompt-conditioned ViT bottleneck on x5
         self.proj_in = nn.Sequential(
@@ -217,20 +219,29 @@ class PRPSegmenter(nn.Module):
 
         self.decoder = UNetDecoder(encoder_channels=[64, 64, 128, 256, 512], skip0_channels=64)
         self.prompt_dropout_p = prompt_dropout_p
+        self.use_ckpt = use_ckpt
 
-    def _apply_prompt_dropout(self, hm: torch.Tensor) -> torch.Tensor:
+    def _maybe_ckpt(self, fn, *args):
+        if self.training and self.use_ckpt:
+            return checkpoint(fn, *args, use_reentrant=False)
+        return fn(*args)
+
+    def _apply_prompt_dropout_pair(self, hm4: torch.Tensor, hm5: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if self.training and self.prompt_dropout_p > 0:
-            keep_mask = (torch.rand_like(hm) > self.prompt_dropout_p).float()
-            return hm * keep_mask
-        return hm
+            keep_mask = (
+                torch.rand((hm4.shape[0], 1, 1, 1), device=hm4.device, dtype=hm4.dtype)
+                > self.prompt_dropout_p
+            ).to(hm4.dtype)
+            hm4 = hm4 * keep_mask
+            hm5 = hm5 * keep_mask
+        return hm4, hm5
 
     def forward(self, image: torch.Tensor, clicks: torch.Tensor) -> torch.Tensor:
-        x0_img = self.stem_conv(image)  # (B, 64, H, W)
         x1_img = self.relu(self.bn1(self.conv1(image)))  # (B, 64, H/2, W/2)
-        x2 = self.layer1(self.maxpool(x1_img))  # (B, 64, H/4, W/4)
-        x3 = self.layer2(x2)  # (B, 128, H/8, W/8)
-        x4_img = self.layer3(x3)  # (B, 256, H/16, W/16)
-        x5_img = self.layer4(x4_img)  # (B, 512, H/32, W/32)
+        x2 = self._maybe_ckpt(lambda t: self.layer1(t), self.maxpool(x1_img))  # (B, 64, H/4, W/4)
+        x3 = self._maybe_ckpt(lambda t: self.layer2(t), x2)  # (B, 128, H/8, W/8)
+        x4_img = self._maybe_ckpt(lambda t: self.layer3(t), x3)  # (B, 256, H/16, W/16)
+        x5_img = self._maybe_ckpt(lambda t: self.layer4(t), x4_img)  # (B, 512, H/32, W/32)
 
         hm4, hm5 = build_heatmap4_5(
             clicks=clicks,
@@ -241,8 +252,7 @@ class PRPSegmenter(nn.Module):
             device=x4_img.device,
         )
 
-        hm4 = self._apply_prompt_dropout(hm4)
-        hm5 = self._apply_prompt_dropout(hm5)
+        hm4, hm5 = self._apply_prompt_dropout_pair(hm4, hm5)
 
         hm4_feat = self.hm4_stem(hm4)
         hm5_feat = self.hm5_stem(hm5)
@@ -255,9 +265,10 @@ class PRPSegmenter(nn.Module):
         g5 = torch.sigmoid(self.g5_raw)
         x5_blend = x5_img + g5 * (x5_cond - x5_img)
 
-        x5_256 = self.proj_in(x5_blend)
-        x5_256 = self.vit_refiner_256(x5_256)
-        x5_out = self.proj_out(x5_256)
+        x5_256 = self._maybe_ckpt(lambda t: self.proj_in(t), x5_blend)
+        x5_256 = self._maybe_ckpt(lambda t: self.vit_refiner_256(t), x5_256)
+        x5_out = self._maybe_ckpt(lambda t: self.proj_out(t), x5_256)
 
+        x0_img = self.stem_conv(image)  # (B, 64, H, W)
         logits = self.decoder([x1_img, x2, x3, x4_out, x5_out], skip0=x0_img)
         return logits

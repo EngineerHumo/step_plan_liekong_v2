@@ -191,13 +191,29 @@ class PRPDataset(torch.utils.data.Dataset):
         selected_label = np.random.choice(valid_labels)
         component_mask = (labels == selected_label).astype(np.uint8)
 
-        inscribed = self._largest_inscribed_circle(component_mask)
-        if inscribed is None:
+        dist_map = cv2.distanceTransform(component_mask, distanceType=cv2.DIST_L2, maskSize=5)
+        _, max_val, _, max_loc = cv2.minMaxLoc(dist_map)
+        if max_val <= 0:
             self._last_click = None
             return full_mask, np.zeros((h, w), dtype=np.float32), None
 
-        (center_x, center_y), radius = inscribed
-        click_y, click_x = self._sample_point_within_circle((center_x, center_y), radius, (h, w))
+        center_x, center_y = max_loc  # cv2 returns (x, y)
+        ys, xs = np.where(component_mask == 1)
+        if len(ys) == 0:
+            self._last_click = None
+            return full_mask, np.zeros((h, w), dtype=np.float32), None
+
+        distances = np.sqrt((ys - center_y) ** 2 + (xs - center_x) ** 2)
+        weights = 1.0 / (distances + 1e-3)
+        weights_sum = weights.sum()
+        if weights_sum <= 0:
+            self._last_click = None
+            return full_mask, np.zeros((h, w), dtype=np.float32), None
+
+        probs = weights / weights_sum
+        idx = np.random.choice(len(xs), p=probs)
+        click_y = int(ys[idx])
+        click_x = int(xs[idx])
         self._last_click = (click_y, click_x)
         heatmap = self._generate_heatmap(h, w, (click_y, click_x))
         return full_mask, heatmap, self._last_click

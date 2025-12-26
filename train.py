@@ -247,7 +247,7 @@ def train(
     val_loader = None
     if val_dir and os.path.exists(val_dir):
         val_dataset = PRPDataset(val_dir, augment=False)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
 
     model = PRPSegmenter()
     if torch.cuda.device_count() > 1 and device.type == "cuda":
@@ -285,7 +285,7 @@ def train(
             point_loss = click_point_loss(logits1, clicks)
             loss = main_loss + 0.01 * point_loss
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
 
