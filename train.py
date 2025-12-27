@@ -48,6 +48,8 @@ def save_validation_batch(
     heatmaps: torch.Tensor,
     masks1: torch.Tensor,
     preds1: torch.Tensor,
+    gt_sdf: Optional[torch.Tensor],
+    pred_sdf: Optional[torch.Tensor],
     save_root: str,
     epoch: int,
     batch_idx: int,
@@ -64,6 +66,8 @@ def save_validation_batch(
         heatmap_np = heatmaps[i, 0].detach().cpu().numpy()
         mask1_np = masks1[i, 0].detach().cpu().numpy()
         pred1_np = preds1[i, 0].detach().cpu().numpy()
+        pred_sdf_np = pred_sdf[i, 0].detach().cpu().numpy() if pred_sdf is not None else None
+        gt_sdf_np = gt_sdf[i, 0].detach().cpu().numpy() if gt_sdf is not None else None
 
         has_click = heatmap_np.max() > 0
         if has_click:
@@ -80,6 +84,14 @@ def save_validation_batch(
         heatmap_resized = cv2.resize(heatmap_np, (original_size[1], original_size[0]))
         mask1_resized = cv2.resize(mask1_np, (original_size[1], original_size[0]), interpolation=cv2.INTER_NEAREST)
         pred1_resized = cv2.resize(pred1_np, (original_size[1], original_size[0]))
+        if pred_sdf_np is not None:
+            pred_sdf_resized = cv2.resize(pred_sdf_np, (original_size[1], original_size[0]))
+        else:
+            pred_sdf_resized = None
+        if gt_sdf_np is not None:
+            gt_sdf_resized = cv2.resize(gt_sdf_np, (original_size[1], original_size[0]))
+        else:
+            gt_sdf_resized = None
 
         image_with_click = image_resized.copy()
         if has_click and click_x_resized is not None and click_y_resized is not None:
@@ -111,6 +123,12 @@ def save_validation_batch(
         cv2.imwrite(os.path.join(epoch_dir, f"{basename}_heatmap.png"), (heatmap_resized * 255).astype(np.uint8))
         cv2.imwrite(os.path.join(epoch_dir, f"{basename}_pred1.png"), pred1_mask)
         cv2.imwrite(os.path.join(epoch_dir, f"{basename}_gt1.png"), gt1_mask)
+        if gt_sdf_resized is not None:
+            gt_sdf_vis = ((gt_sdf_resized + 1.0) * 0.5 * 255).astype(np.uint8)
+            cv2.imwrite(os.path.join(epoch_dir, f"{basename}_gt_sdf.png"), gt_sdf_vis)
+        if pred_sdf_resized is not None:
+            pred_sdf_vis = ((pred_sdf_resized + 1.0) * 0.5 * 255).astype(np.uint8)
+            cv2.imwrite(os.path.join(epoch_dir, f"{basename}_pred_sdf.png"), pred_sdf_vis)
 
 
 def dice_bce_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -151,6 +169,8 @@ def _log_images_to_visdom(
     heatmaps: torch.Tensor,
     masks1: torch.Tensor,
     preds1: torch.Tensor,
+    gt_sdf: Optional[torch.Tensor],
+    pred_sdf: Optional[torch.Tensor],
     clicks: torch.Tensor,
     epoch: int,
     prefix: str = "val",
@@ -173,12 +193,18 @@ def _log_images_to_visdom(
     heatmap = _prep_single(heatmaps[0])
     gt1 = _prep_single(masks1[0])
     pred1 = _prep_single(preds1[0])
+    sdf_gt_img = _prep_single((gt_sdf[0] + 1.0) * 0.5) if gt_sdf is not None else None
+    sdf_pred_img = _prep_single((pred_sdf[0] + 1.0) * 0.5) if pred_sdf is not None else None
 
     viz.image(img, win=f"{prefix}_input_image", opts={"title": f"{prefix.capitalize()} Input Epoch {epoch}"})
     viz.image(img_for_click, win=f"{prefix}_click", opts={"title": f"{prefix.capitalize()} Click Epoch {epoch}"})
     viz.image(heatmap, win=f"{prefix}_heatmap", opts={"title": f"{prefix.capitalize()} Heatmap Epoch {epoch}"})
     viz.image(gt1, win=f"{prefix}_ground_truth_1", opts={"title": f"{prefix.capitalize()} GT1 Epoch {epoch}"})
     viz.image(pred1, win=f"{prefix}_prediction_1", opts={"title": f"{prefix.capitalize()} Pred1 Epoch {epoch}"})
+    if sdf_gt_img is not None:
+        viz.image(sdf_gt_img, win=f"{prefix}_gt_sdf", opts={"title": f"{prefix.capitalize()} GT SDF Epoch {epoch}"})
+    if sdf_pred_img is not None:
+        viz.image(sdf_pred_img, win=f"{prefix}_pred_sdf", opts={"title": f"{prefix.capitalize()} Pred SDF Epoch {epoch}"})
 
 
 def evaluate(
@@ -193,11 +219,12 @@ def evaluate(
     dice_scores = []
     iou_scores = []
     with torch.no_grad():
-        for batch_idx, (images, heatmaps, masks1, clicks) in enumerate(loader):
+        for batch_idx, (images, heatmaps, masks1, clicks, gt_sdf) in enumerate(loader):
             images = images.to(device)
             masks1 = masks1.to(device)
             clicks = clicks.to(device)
-            logits1 = model(images, clicks)
+            gt_sdf = gt_sdf.to(device)
+            logits1, pred_sdf = model(images, clicks)
             preds1 = torch.sigmoid(logits1)
             dice_scores.append(dice_coefficient(preds1, masks1).mean().item())
             iou_scores.append(iou_score(preds1, masks1).mean().item())
@@ -208,12 +235,16 @@ def evaluate(
                     heatmaps=heatmaps,
                     masks1=masks1,
                     preds1=preds1,
+                    gt_sdf=gt_sdf,
+                    pred_sdf=pred_sdf,
                     save_root=save_root,
                     epoch=epoch,
                     batch_idx=batch_idx,
                 )
             if viz is not None and batch_idx == 0:
-                _log_images_to_visdom(viz, images, heatmaps, masks1, preds1, clicks, epoch, prefix="val")
+                _log_images_to_visdom(
+                    viz, images, heatmaps, masks1, preds1, gt_sdf, pred_sdf, clicks, epoch, prefix="val"
+                )
     model.train()
     return float(sum(dice_scores) / len(dice_scores)), float(sum(iou_scores) / len(iou_scores))
 
@@ -230,6 +261,7 @@ def train(
     visdom_env: str = "prp_segmentation",
     visdom_port: int = 8097,
     output_dir: str = "output",
+    sdf_loss_weight: float = 0.2,
 ):
     device = torch.device(device)
     ensure_dir(output_dir)
@@ -275,26 +307,31 @@ def train(
         epoch_loss = 0.0
         progress = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}")
 
-        for images, heatmaps, masks1, clicks in progress:
+        for images, heatmaps, masks1, clicks, gt_sdf in progress:
             images = images.to(device)
             masks1 = masks1.to(device)
             clicks = clicks.to(device)
 
-            logits1 = model(images, clicks)
+            gt_sdf = gt_sdf.to(device)
+
+            logits1, pred_sdf = model(images, clicks)
             main_loss = dice_bce_loss(logits1, masks1)
             point_loss = click_point_loss(logits1, clicks)
-            loss = main_loss + 0.01 * point_loss
+            sdf_loss = nn.functional.smooth_l1_loss(pred_sdf, gt_sdf)
+            loss = main_loss + 0.01 * point_loss + sdf_loss_weight * sdf_loss
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
 
             epoch_loss += loss.item()
-            progress.set_postfix(loss=loss.item(), point_loss=point_loss.item())
+            progress.set_postfix(loss=loss.item(), point_loss=point_loss.item(), sdf_loss=sdf_loss.item())
 
             if viz is not None:
                 preds1 = torch.sigmoid(logits1)
-                _log_images_to_visdom(viz, images, heatmaps, masks1, preds1, clicks, epoch, prefix="train")
+                _log_images_to_visdom(
+                    viz, images, heatmaps, masks1, preds1, gt_sdf, pred_sdf, clicks, epoch, prefix="train"
+                )
 
         scheduler.step()
         avg_loss = epoch_loss / len(train_loader)
@@ -360,6 +397,7 @@ def parse_args():
     parser.add_argument("--visdom_env", type=str, default="prp_segmentation", help="Visdom environment name")
     parser.add_argument("--visdom_port", type=int, default=8097, help="Visdom server port")
     parser.add_argument("--output_dir", type=str, default="output", help="Directory to save validation outputs and models")
+    parser.add_argument("--sdf_loss_weight", type=float, default=0.2, help="Weight for the SDF regression loss")
     return parser.parse_args()
 
 
@@ -380,4 +418,5 @@ if __name__ == "__main__":
         visdom_env=args.visdom_env,
         visdom_port=args.visdom_port,
         output_dir=args.output_dir,
+        sdf_loss_weight=args.sdf_loss_weight,
     )

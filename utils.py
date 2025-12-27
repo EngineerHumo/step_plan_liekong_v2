@@ -1,7 +1,9 @@
 from typing import Optional
 
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
+from scipy.ndimage import distance_transform_edt
 
 
 def dice_coefficient(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -19,7 +21,42 @@ def iou_score(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> to
     return (intersection + eps) / (union + eps)
 
 
-def plot_sample(image: torch.Tensor, heatmap: torch.Tensor, pred: torch.Tensor, mask: torch.Tensor, save_path: Optional[str] = None):
+def compute_sdf(mask: np.ndarray, dmax: int = 20) -> np.ndarray:
+    """Compute a clipped and normalized signed distance map for a binary mask.
+
+    The returned map follows the convention of negative values inside the lesion
+    (mask==1) and positive values outside. Distances are clipped to ``[-dmax,
+    dmax]`` and normalized to ``[-1, 1]`` for stable regression.
+
+    Args:
+        mask: A binary numpy array of shape ``H x W`` (or higher dims) with
+            values in {0, 1}.
+        dmax: Maximum distance (in pixels) before clipping.
+
+    Returns:
+        Float32 numpy array with the same shape as ``mask`` representing the
+        normalized signed distance function.
+    """
+
+    if mask.dtype != np.bool_:
+        mask_bool = mask.astype(bool)
+    else:
+        mask_bool = mask
+
+    dist_out = distance_transform_edt(~mask_bool)
+    dist_in = distance_transform_edt(mask_bool)
+    sdf = dist_out - dist_in
+    sdf = np.clip(sdf, -dmax, dmax) / float(dmax)
+    return sdf.astype(np.float32)
+
+
+def plot_sample(
+    image: torch.Tensor,
+    heatmap: torch.Tensor,
+    pred: torch.Tensor,
+    mask: torch.Tensor,
+    save_path: Optional[str] = None,
+):
     """
     Plot input image, heatmap, prediction and ground truth mask for quick inspection.
     Expects tensors in CHW format.
