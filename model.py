@@ -35,7 +35,6 @@ def build_gaussian_heatmap(
     Coordinates are mapped with align_corners=False convention using pixel centers.
     Sigma is defined in the pixel units of the *output* feature map (deep feature space).
     """
-
     batch = clicks.shape[0]
     h_out, w_out = out_hw
     heatmap = torch.zeros((batch, 1, h_out, w_out), device=device, dtype=dtype)
@@ -53,7 +52,7 @@ def build_gaussian_heatmap(
         x_out = (float(x_in) + 0.5) * scale_x - 0.5
 
         dist = (yy - y_out) ** 2 + (xx - x_out) ** 2
-        hm = torch.exp(-dist / (2 * sigma ** 2))
+        hm = torch.exp(-dist / (2 * sigma**2))
         if normalize_peak:
             peak = hm.max()
             if peak > 0:
@@ -75,7 +74,6 @@ def build_heatmap4_5(
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Wrapper to build deep-scale heatmaps for x4 and x5 injection."""
-
     hm4 = build_gaussian_heatmap(clicks, in_hw, x4_hw, sigma4, dtype=dtype, device=device)
     hm5 = build_gaussian_heatmap(clicks, in_hw, x5_hw, sigma5, dtype=dtype, device=device)
     return hm4, hm5
@@ -105,7 +103,7 @@ class ViTFeatureRefiner(nn.Module):
             indexing="ij",
         )
         omega = torch.arange(channels // 4, device=device, dtype=dtype) / (channels // 4)
-        omega = 1.0 / (10000 ** omega)
+        omega = 1.0 / (10000**omega)
         out_y = torch.einsum("hw,c->hwc", grid_y, omega)
         out_x = torch.einsum("hw,c->hwc", grid_x, omega)
         pos_emb = torch.cat([torch.sin(out_y), torch.cos(out_y), torch.sin(out_x), torch.cos(out_x)], dim=-1)
@@ -226,39 +224,63 @@ class PRPSegmenter(nn.Module):
 
     @staticmethod
     @contextmanager
-    def _maybe_freeze_bn_tracking(module: nn.Module, disable: bool):
-        """Temporarily disable BatchNorm running-stat updates when requested."""
-        if not disable:
+    def _maybe_restore_bn_buffers(module: nn.Module, enable: bool):
+        """
+        For non-reentrant checkpointing: keep BN forward/recompute behavior identical
+        (to satisfy checkpoint consistency checks), but restore BN running buffers after
+        recomputation so running stats are not double-counted.
+        """
+        if not enable:
             yield
             return
 
-        bn_layers = [m for m in module.modules() if isinstance(m, _BatchNorm)]
+        bn_layers = [
+            m
+            for m in module.modules()
+            if isinstance(m, _BatchNorm) and getattr(m, "track_running_stats", False)
+        ]
         if not bn_layers:
             yield
             return
 
-        original_states = [bn.track_running_stats for bn in bn_layers]
+        backups: list[tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]] = []
+        for bn in bn_layers:
+            rm = getattr(bn, "running_mean", None)
+            rv = getattr(bn, "running_var", None)
+            nbt = getattr(bn, "num_batches_tracked", None)
+
+            rm_b = None if rm is None else rm.detach().clone()
+            rv_b = None if rv is None else rv.detach().clone()
+            nbt_b = None if nbt is None else nbt.detach().clone()
+            backups.append((rm_b, rv_b, nbt_b))
+
         try:
-            for bn in bn_layers:
-                bn.track_running_stats = False
             yield
         finally:
-            for bn, state in zip(bn_layers, original_states):
-                bn.track_running_stats = state
+            for bn, (rm_b, rv_b, nbt_b) in zip(bn_layers, backups):
+                if rm_b is not None and getattr(bn, "running_mean", None) is not None:
+                    bn.running_mean.data.copy_(rm_b)
+                if rv_b is not None and getattr(bn, "running_var", None) is not None:
+                    bn.running_var.data.copy_(rv_b)
+                if nbt_b is not None and getattr(bn, "num_batches_tracked", None) is not None:
+                    bn.num_batches_tracked.data.copy_(nbt_b)
 
     def _maybe_ckpt_module(self, module: nn.Module, *args):
         """
-        Checkpoint a module, and if it contains BatchNorm, prevent double-updating
-        BN running stats by freezing tracking only during recompute.
+        Checkpoint a module. If it contains BatchNorm with running-stat tracking,
+        prevent double-counting by restoring BN buffers after recomputation.
         """
         if self.training and self.use_ckpt:
-            has_bn = any(isinstance(m, _BatchNorm) for m in module.modules())
+            has_bn = any(
+                isinstance(m, _BatchNorm) and getattr(m, "track_running_stats", False)
+                for m in module.modules()
+            )
 
             if has_bn:
                 def context_fn():
                     # forward: normal
-                    # recompute: freeze BN running-stat tracking
-                    return nullcontext(), self._maybe_freeze_bn_tracking(module, True)
+                    # recompute: normal, but restore BN buffers afterward (no net update)
+                    return nullcontext(), self._maybe_restore_bn_buffers(module, True)
 
                 return checkpoint(module, *args, use_reentrant=False, context_fn=context_fn)
 
