@@ -9,6 +9,8 @@ import torch
 from albumentations.pytorch import ToTensorV2
 from albumentations.core.transforms_interface import BasicTransform
 
+from utils import compute_sdf
+
 
 class PRPDataset(torch.utils.data.Dataset):
     """Dataset for semi-automatic PRP segmentation with a single target.
@@ -246,11 +248,13 @@ class PRPDataset(torch.utils.data.Dataset):
                 "heatmap": "mask",
             },
         )
+        sdf = compute_sdf(mask1)
         tensors = tensor_transform(image=image, mask1=mask1, heatmap=heatmap)
         image_tensor = tensors["image"]
         mask1_tensor = tensors["mask1"].unsqueeze(0).float()
         heatmap_tensor = tensors["heatmap"].float().unsqueeze(0)
+        sdf_tensor = torch.from_numpy(sdf).unsqueeze(0)
 
         click_coords = torch.tensor(self._last_click or (-1, -1), dtype=torch.long)
 
-        return image_tensor, heatmap_tensor, mask1_tensor, click_coords
+        return image_tensor, heatmap_tensor, mask1_tensor, click_coords, sdf_tensor

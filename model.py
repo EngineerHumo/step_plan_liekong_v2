@@ -139,7 +139,7 @@ class UpBlock(nn.Module):
 
 
 class UNetDecoder(nn.Module):
-    def __init__(self, encoder_channels, skip0_channels: int):
+    def __init__(self, encoder_channels, skip0_channels: int, final_activation=None):
         super().__init__()
         self.up4 = UpBlock(encoder_channels[4], encoder_channels[3], encoder_channels[3])
         self.up3 = UpBlock(encoder_channels[3], encoder_channels[2], encoder_channels[2])
@@ -147,6 +147,7 @@ class UNetDecoder(nn.Module):
         self.up1 = UpBlock(encoder_channels[1], encoder_channels[0], encoder_channels[0])
         self.up0 = UpBlock(encoder_channels[0], skip0_channels, encoder_channels[0])
         self.final_conv = nn.Conv2d(encoder_channels[0], 1, kernel_size=1)
+        self.final_activation = final_activation
 
     def forward(self, features, skip0: torch.Tensor):
         c1, c2, c3, c4, c5 = features
@@ -155,7 +156,10 @@ class UNetDecoder(nn.Module):
         x = self.up2(x, c2)
         x = self.up1(x, c1)
         x = self.up0(x, skip0)
-        return self.final_conv(x)
+        x = self.final_conv(x)
+        if self.final_activation is not None:
+            x = self.final_activation(x)
+        return x
 
 
 class PRPSegmenter(nn.Module):
@@ -218,7 +222,10 @@ class PRPSegmenter(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        self.decoder = UNetDecoder(encoder_channels=[64, 64, 128, 256, 512], skip0_channels=64)
+        self.seg_decoder = UNetDecoder(encoder_channels=[64, 64, 128, 256, 512], skip0_channels=64)
+        self.sdf_decoder = UNetDecoder(
+            encoder_channels=[64, 64, 128, 256, 512], skip0_channels=64, final_activation=torch.tanh
+        )
         self.prompt_dropout_p = prompt_dropout_p
         self.use_ckpt = use_ckpt
 
@@ -298,7 +305,7 @@ class PRPSegmenter(nn.Module):
             hm5 = hm5 * keep_mask
         return hm4, hm5
 
-    def forward(self, image: torch.Tensor, clicks: torch.Tensor) -> torch.Tensor:
+    def forward(self, image: torch.Tensor, clicks: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         x1_img = self.relu(self.bn1(self.conv1(image)))  # (B, 64, H/2, W/2)
         x2 = self._maybe_ckpt_module(self.layer1, self.maxpool(x1_img))  # (B, 64, H/4, W/4)
         x3 = self._maybe_ckpt_module(self.layer2, x2)  # (B, 128, H/8, W/8)
@@ -332,5 +339,6 @@ class PRPSegmenter(nn.Module):
         x5_out = self._maybe_ckpt_module(self.proj_out, x5_256)
 
         x0_img = self.stem_conv(image)  # (B, 64, H, W)
-        logits = self.decoder([x1_img, x2, x3, x4_out, x5_out], skip0=x0_img)
-        return logits
+        logits = self.seg_decoder([x1_img, x2, x3, x4_out, x5_out], skip0=x0_img)
+        sdf_pred = self.sdf_decoder([x1_img, x2, x3, x4_out, x5_out], skip0=x0_img)
+        return logits, sdf_pred
