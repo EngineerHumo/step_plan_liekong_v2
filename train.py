@@ -270,12 +270,14 @@ def train(
     best_epoch: Optional[int] = None
     best_epochs: list[tuple[int, float]] = []
     saved_model_paths: dict[int, str] = {}
+    accum_steps = 3
 
     for epoch in range(1, epochs + 1):
         epoch_loss = 0.0
         progress = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}")
+        optimizer.zero_grad(set_to_none=True)
 
-        for images, heatmaps, masks1, clicks in progress:
+        for step_idx, (images, heatmaps, masks1, clicks) in enumerate(progress):
             images = images.to(device)
             masks1 = masks1.to(device)
             clicks = clicks.to(device)
@@ -283,18 +285,25 @@ def train(
             logits1 = model(images, clicks)
             main_loss = dice_bce_loss(logits1, masks1)
             point_loss = click_point_loss(logits1, clicks)
-            loss = main_loss + 0.01 * point_loss
+            total_loss = main_loss + 0.01 * point_loss
+            loss = total_loss / accum_steps
 
-            optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            optimizer.step()
 
-            epoch_loss += loss.item()
-            progress.set_postfix(loss=loss.item(), point_loss=point_loss.item())
+            if (step_idx + 1) % accum_steps == 0:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+            epoch_loss += total_loss.item()
+            progress.set_postfix(loss=total_loss.item(), point_loss=point_loss.item())
 
             if viz is not None:
                 preds1 = torch.sigmoid(logits1)
                 _log_images_to_visdom(viz, images, heatmaps, masks1, preds1, clicks, epoch, prefix="train")
+
+        if len(train_loader) % accum_steps != 0:
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
         scheduler.step()
         avg_loss = epoch_loss / len(train_loader)
