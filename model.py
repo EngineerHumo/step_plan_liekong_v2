@@ -1,10 +1,23 @@
-from contextlib import contextmanager, nullcontext
-
 import torch
 import torch.nn as nn
-from torch.nn.modules.batchnorm import _BatchNorm
 from torch.utils.checkpoint import checkpoint
 from torchvision import models
+
+
+def gn(num_channels: int, num_groups: int = 32) -> nn.GroupNorm:
+    groups = min(num_groups, num_channels)
+    while num_channels % groups != 0 and groups > 1:
+        groups -= 1
+    return nn.GroupNorm(groups, num_channels)
+
+
+def replace_bn_with_gn(module: nn.Module, num_groups: int = 32) -> None:
+    for name, child in module.named_children():
+        if isinstance(child, nn.BatchNorm2d):
+            gn_layer = gn(child.num_features, num_groups)
+            setattr(module, name, gn_layer)
+        else:
+            replace_bn_with_gn(child, num_groups)
 
 
 _heatmap_grid_cache: dict[tuple[int, int, torch.device, torch.dtype], tuple[torch.Tensor, torch.Tensor]] = {}
@@ -159,7 +172,13 @@ class UNetDecoder(nn.Module):
 
 
 class PRPSegmenter(nn.Module):
-    def __init__(self, pretrained: bool = True, prompt_dropout_p: float = 0.2, use_ckpt: bool = True):
+    def __init__(
+        self,
+        pretrained: bool = True,
+        prompt_dropout_p: float = 0.2,
+        use_ckpt: bool = True,
+        freeze_backbone_bn_affine: bool = False,
+    ):
         super().__init__()
         backbone = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None)
         self.conv1 = backbone.conv1
@@ -221,72 +240,18 @@ class PRPSegmenter(nn.Module):
         self.decoder = UNetDecoder(encoder_channels=[64, 64, 128, 256, 512], skip0_channels=64)
         self.prompt_dropout_p = prompt_dropout_p
         self.use_ckpt = use_ckpt
+        self.freeze_backbone_bn_affine = freeze_backbone_bn_affine
 
-    @staticmethod
-    @contextmanager
-    def _maybe_restore_bn_buffers(module: nn.Module, enable: bool):
-        """
-        For non-reentrant checkpointing: keep BN forward/recompute behavior identical
-        (to satisfy checkpoint consistency checks), but restore BN running buffers after
-        recomputation so running stats are not double-counted.
-        """
-        if not enable:
-            yield
-            return
+        replace_bn_with_gn(self.stem_conv, 32)
+        replace_bn_with_gn(self.hm4_stem, 32)
+        replace_bn_with_gn(self.hm5_stem, 32)
+        replace_bn_with_gn(self.mix4, 32)
+        replace_bn_with_gn(self.mix5, 32)
+        replace_bn_with_gn(self.proj_in, 32)
+        replace_bn_with_gn(self.proj_out, 32)
+        replace_bn_with_gn(self.decoder, 32)
 
-        bn_layers = [
-            m
-            for m in module.modules()
-            if isinstance(m, _BatchNorm) and getattr(m, "track_running_stats", False)
-        ]
-        if not bn_layers:
-            yield
-            return
-
-        backups: list[tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]] = []
-        for bn in bn_layers:
-            rm = getattr(bn, "running_mean", None)
-            rv = getattr(bn, "running_var", None)
-            nbt = getattr(bn, "num_batches_tracked", None)
-
-            rm_b = None if rm is None else rm.detach().clone()
-            rv_b = None if rv is None else rv.detach().clone()
-            nbt_b = None if nbt is None else nbt.detach().clone()
-            backups.append((rm_b, rv_b, nbt_b))
-
-        try:
-            yield
-        finally:
-            for bn, (rm_b, rv_b, nbt_b) in zip(bn_layers, backups):
-                if rm_b is not None and getattr(bn, "running_mean", None) is not None:
-                    bn.running_mean.data.copy_(rm_b)
-                if rv_b is not None and getattr(bn, "running_var", None) is not None:
-                    bn.running_var.data.copy_(rv_b)
-                if nbt_b is not None and getattr(bn, "num_batches_tracked", None) is not None:
-                    bn.num_batches_tracked.data.copy_(nbt_b)
-
-    def _maybe_ckpt_module(self, module: nn.Module, *args):
-        """
-        Checkpoint a module. If it contains BatchNorm with running-stat tracking,
-        prevent double-counting by restoring BN buffers after recomputation.
-        """
-        if self.training and self.use_ckpt:
-            has_bn = any(
-                isinstance(m, _BatchNorm) and getattr(m, "track_running_stats", False)
-                for m in module.modules()
-            )
-
-            if has_bn:
-                def context_fn():
-                    # forward: normal
-                    # recompute: normal, but restore BN buffers afterward (no net update)
-                    return nullcontext(), self._maybe_restore_bn_buffers(module, True)
-
-                return checkpoint(module, *args, use_reentrant=False, context_fn=context_fn)
-
-            return checkpoint(module, *args, use_reentrant=False)
-
-        return module(*args)
+        self.freeze_backbone_bn(freeze_affine=self.freeze_backbone_bn_affine)
 
     def _apply_prompt_dropout_pair(self, hm4: torch.Tensor, hm5: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if self.training and self.prompt_dropout_p > 0:
@@ -298,12 +263,34 @@ class PRPSegmenter(nn.Module):
             hm5 = hm5 * keep_mask
         return hm4, hm5
 
+    def freeze_backbone_bn(self, freeze_affine: bool = False) -> None:
+        for module in (self.bn1, self.layer1, self.layer2, self.layer3, self.layer4):
+            for m in module.modules():
+                if isinstance(m, nn.BatchNorm2d):
+                    m.eval()
+                    if freeze_affine:
+                        if m.weight is not None:
+                            m.weight.requires_grad_(False)
+                        if m.bias is not None:
+                            m.bias.requires_grad_(False)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if mode:
+            self.freeze_backbone_bn(freeze_affine=self.freeze_backbone_bn_affine)
+        return self
+
+    def ckpt(self, fn, *args):
+        if self.training and self.use_ckpt:
+            return checkpoint(fn, *args)
+        return fn(*args)
+
     def forward(self, image: torch.Tensor, clicks: torch.Tensor) -> torch.Tensor:
         x1_img = self.relu(self.bn1(self.conv1(image)))  # (B, 64, H/2, W/2)
-        x2 = self._maybe_ckpt_module(self.layer1, self.maxpool(x1_img))  # (B, 64, H/4, W/4)
-        x3 = self._maybe_ckpt_module(self.layer2, x2)  # (B, 128, H/8, W/8)
-        x4_img = self._maybe_ckpt_module(self.layer3, x3)  # (B, 256, H/16, W/16)
-        x5_img = self._maybe_ckpt_module(self.layer4, x4_img)  # (B, 512, H/32, W/32)
+        x2 = self.ckpt(self.layer1, self.maxpool(x1_img))  # (B, 64, H/4, W/4)
+        x3 = self.ckpt(self.layer2, x2)  # (B, 128, H/8, W/8)
+        x4_img = self.ckpt(self.layer3, x3)  # (B, 256, H/16, W/16)
+        x5_img = self.ckpt(self.layer4, x4_img)  # (B, 512, H/32, W/32)
 
         hm4, hm5 = build_heatmap4_5(
             clicks=clicks,
@@ -327,9 +314,9 @@ class PRPSegmenter(nn.Module):
         g5 = torch.sigmoid(self.g5_raw)
         x5_blend = x5_img + g5 * (x5_cond - x5_img)
 
-        x5_256 = self._maybe_ckpt_module(self.proj_in, x5_blend)
-        x5_256 = self._maybe_ckpt_module(self.vit_refiner_256, x5_256)
-        x5_out = self._maybe_ckpt_module(self.proj_out, x5_256)
+        x5_256 = self.ckpt(self.proj_in, x5_blend)
+        x5_256 = self.ckpt(self.vit_refiner_256, x5_256)
+        x5_out = self.ckpt(self.proj_out, x5_256)
 
         x0_img = self.stem_conv(image)  # (B, 64, H, W)
         logits = self.decoder([x1_img, x2, x3, x4_out, x5_out], skip0=x0_img)
