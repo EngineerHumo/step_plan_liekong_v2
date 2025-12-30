@@ -251,29 +251,30 @@ def connect_close_components(mask: np.ndarray, max_distance: float = 100.0) -> n
 
 def infer_with_click(
         model: PRPSegmenter,
-        image: Image.Image,
+        image_tensor: torch.Tensor,
         click_xy: Tuple[float, float] | None,
-        sigma: float,
+        display_image: Image.Image,
         device: torch.device,
         gt1_threshold: float,
         confidence_threshold: float,
         circle_diameter: int,
         circle_spacing: int,
+        display_size: int,
 ) -> Tuple[np.ndarray, Image.Image]:
-    input_image = image.resize((1280, 1280), Image.BILINEAR)
     if click_xy is None:
-        heatmap_np = np.zeros((1280, 1280), dtype=np.float32)
+        # 通过传入无效坐标（-1, -1）来显式丢弃 prompt，实现“无点击”推理
+        click_tensor = torch.tensor([[-1.0, -1.0]], device=device)
     else:
-        click_scaled = (click_xy[0] / 1240 * 1280, click_xy[1] / 1240 * 1280)
-        heatmap_np = generate_gaussian_heatmap(1280, 1280, click_scaled, sigma)
-
-    image_tensor = pil_to_tensor(input_image).unsqueeze(0).to(device)
-    heatmap_tensor = torch.from_numpy(heatmap_np).unsqueeze(0).unsqueeze(0).to(device)
+        # Matplotlib 返回 (x, y)，而模型内部使用 (y, x) 生成热力图，需对齐顺序
+        scale = image_tensor.shape[-1] / float(display_size)
+        click_y = click_xy[1] * scale
+        click_x = click_xy[0] * scale
+        click_tensor = torch.tensor([[click_y, click_x]], device=device)
 
     with torch.no_grad():
-        pred1 = model(image_tensor, heatmap_tensor)
+        pred1 = model(image_tensor, click_tensor)
 
-    pred1_resized = F.interpolate(pred1, size=(1240, 1240), mode="bilinear", align_corners=False)
+    pred1_resized = F.interpolate(pred1, size=(display_size, display_size), mode="bilinear", align_corners=False)
     logits = pred1_resized.squeeze().cpu().numpy()
 
     gt1_initial = logits >= gt1_threshold
@@ -296,8 +297,7 @@ def infer_with_click(
         radius=circle_diameter // 2,
         spacing=circle_spacing,
     )
-    resized_image = image.resize((1240, 1240), Image.BILINEAR)
-    overlay = draw_circles_on_image(resized_image, centers, diameter=circle_diameter)
+    overlay = draw_circles_on_image(display_image, centers, diameter=circle_diameter)
 
     return gt1_connected.astype(np.uint8), overlay
 
@@ -375,7 +375,6 @@ def main():
         default=0.9,
         help="保留连通区域所需的最小 logits 阈值",
     )
-    parser.add_argument("--sigma", type=float, default=15.0, help="点击生成高斯热图的标准差")
     parser.add_argument("--circle-diameter", type=int, default=15, help="绘制蓝色圆的直径")
     parser.add_argument(
         "--circle-spacing",
@@ -411,11 +410,15 @@ def main():
         return
 
     model = load_model(args.model_path, device)
+    inference_size = 1280
+    display_size = 1240
 
     for img_idx, img_path in enumerate(image_files):
         print(f"\n正在处理第 {img_idx + 1}/{len(image_files)} 张图像: {img_path}")
         image = Image.open(img_path).convert("RGB")
-        display_image = image.resize((1240, 1240), Image.BILINEAR)
+        display_image = image.resize((display_size, display_size), Image.BILINEAR)
+        image_tensor = pil_to_tensor(image.resize((inference_size, inference_size), Image.BILINEAR))
+        image_tensor = image_tensor.unsqueeze(0).to(device)
 
         result_figs: List[plt.Figure] = []
         click_counter = 0
@@ -440,17 +443,18 @@ def main():
         def run_inference(click_xy: Tuple[float, float] | None):
             return infer_with_click(
                 model=model,
-                image=image,
+                image_tensor=image_tensor,
                 click_xy=click_xy,
-                sigma=args.sigma,
+                display_image=display_image,
                 device=device,
                 gt1_threshold=args.gt1_threshold,
                 confidence_threshold=args.confidence_threshold,
                 circle_diameter=args.circle_diameter,
                 circle_spacing=args.circle_spacing,
+                display_size=display_size,
             )
 
-        print("执行自动推理（无点击，高斯热图全黑）...")
+        print("执行自动推理（无点击，丢弃提示信号）...")
         auto_gt1, auto_overlay = run_inference(None)
         save_and_show(auto_gt1, auto_overlay, "auto")
 
